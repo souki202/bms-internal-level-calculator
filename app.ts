@@ -4,6 +4,7 @@ import * as path from "path";
 const DEFAULT_SONGDATA_DB_PATH = "F:\\Games\\beatoraja - コピー\\songdata.db";
 const DEFAULT_INSANE_TABLE_PATH = path.resolve("insane_data.json");
 const DEFAULT_NORMAL_TABLE_PATH = path.resolve("normal_data.json");
+const DEFAULT_OVERJOY_TABLE_PATH = path.resolve("overjoy_data.json");
 const DEFAULT_OUTPUT_PATH = path.resolve("classified.json");
 const DEFAULT_ANCHORS_PATH = path.resolve("anchors.json");
 
@@ -30,6 +31,12 @@ type InsaneEntry = {
 };
 
 type NormalEntry = {
+	level?: string | number | null;
+	title?: string | null;
+	md5?: string | null;
+};
+
+type OverjoyEntry = {
 	level?: string | number | null;
 	title?: string | null;
 	md5?: string | null;
@@ -314,6 +321,41 @@ function readNormalTableLevels(normalPath: string): Map<string, number> {
 		const rank = normalLevelRank(e.level ?? null);
 		if (!rank) continue;
 		map.set(md5, rank);
+	}
+	return map;
+}
+
+function overjoyLevelToStar(level: string | number | null | undefined): number | null {
+	if (level === null || level === undefined) return null;
+	const s = String(level).trim();
+	if (!s) return null;
+	// allow "★★5" or "5"
+	const m = s.match(/^(?:★★)?\s*(\d+)$/);
+	if (!m) return null;
+	const n = parseInt(m[1], 10);
+	if (!Number.isFinite(n)) return null;
+	if (n <= 0) return null;
+	// Spec: ★★1=★21, ★★2=★22, ★★3=★23, ★★4=★24, ★★5=★25
+	if (n >= 1 && n <= 5) return 20 + n;
+	// ★★6..7: no direct correspondence; treat as 26, 27
+	if (n === 6) return 26;
+	if (n === 7) return 27;
+	// ★★8: physically impossible -> ignore
+	return null;
+}
+
+function readOverjoyTableLevels(overjoyPath: string): Map<string, number> {
+	const buf = fs.readFileSync(overjoyPath);
+	const text = decodeTextSmart(buf);
+	const arr = JSON.parse(text) as OverjoyEntry[];
+	if (!Array.isArray(arr)) throw new Error(`overjoy table must be array: ${overjoyPath}`);
+	const map = new Map<string, number>();
+	for (const e of arr) {
+		const md5 = normalizeMd5(e.md5 ?? null);
+		if (!md5) continue;
+		const star = overjoyLevelToStar(e.level ?? null);
+		if (star === null) continue;
+		map.set(md5, star);
 	}
 	return map;
 }
@@ -1069,6 +1111,7 @@ async function main(): Promise<void> {
 	const dbPath = process.env.SONGDATA_DB_PATH ?? DEFAULT_SONGDATA_DB_PATH;
 	const insanePath = process.env.INSANE_TABLE_PATH ?? DEFAULT_INSANE_TABLE_PATH;
 	const normalPath = process.env.NORMAL_TABLE_PATH ?? DEFAULT_NORMAL_TABLE_PATH;
+	const overjoyPath = process.env.OVERJOY_TABLE_PATH ?? DEFAULT_OVERJOY_TABLE_PATH;
 	const outPath = process.env.OUT_PATH ?? DEFAULT_OUTPUT_PATH;
 	const anchorsPath = process.env.ANCHORS_PATH ?? DEFAULT_ANCHORS_PATH;
 	const concurrency = clamp(parseIntSafe(process.env.CONCURRENCY ?? "4", 10) ?? 4, 1, 16);
@@ -1078,6 +1121,7 @@ async function main(): Promise<void> {
 	const normalStarMin = parseFloatSafe(process.env.NORMAL_STAR_MIN) ?? -11;
 	const normalStarMax = parseFloatSafe(process.env.NORMAL_STAR_MAX) ?? 2;
 	const normalWeight = parseFloatSafe(process.env.NORMAL_WEIGHT) ?? 0.35;
+	const overjoyWeight = parseFloatSafe(process.env.OVERJOY_WEIGHT) ?? 1.25;
 
 	let missingFileLogs = 0;
 	const maxMissingFileLogs = 20;
@@ -1088,8 +1132,12 @@ async function main(): Promise<void> {
 	const songs = await readSongDataFromDb(dbPath);
 	const insaneMd5ToLevel = readInsaneTableLevels(insanePath);
 	const normalMd5ToRank = fs.existsSync(normalPath) ? readNormalTableLevels(normalPath) : new Map<string, number>();
+	const overjoyMd5ToStar = fs.existsSync(overjoyPath) ? readOverjoyTableLevels(overjoyPath) : new Map<string, number>();
 	if (normalMd5ToRank.size > 0) {
 		console.log(`normal table entries: ${normalMd5ToRank.size} (${normalPath})`);
+	}
+	if (overjoyMd5ToStar.size > 0) {
+		console.log(`overjoy table entries: ${overjoyMd5ToStar.size} (${overjoyPath})`);
 	}
 
 	if (debugSinglePath) {
@@ -1107,6 +1155,7 @@ async function main(): Promise<void> {
 	// Add ★25 anchor: FREEDOM DiVE [FOUR DIMENSIONS]
 	const fd = findFreedomDiveFourDimensions(songs);
 	if (fd) insaneMd5ToLevel.set(fd.md5, 25);
+	const fdMd5 = fd?.md5 ?? null;
 
 	const songsByMd5 = new Map<string, SongRow>();
 	for (const s of songs) songsByMd5.set(s.md5, s);
@@ -1128,7 +1177,12 @@ async function main(): Promise<void> {
 		try {
 			const r = await analyzeSong(song);
 			const x = featureVector(r.features);
-			const w = level === 25 ? 12 : 1;
+			let w = 1;
+			// Top end is sparse + non-linear; emphasize high-end labels.
+			if (level >= 24) w = 8;
+			if (level === 25) w = 18;
+			// Pin the explicit ★25 anchor harder so it doesn't drift to ★24.x.
+			if (fdMd5 && song.md5 === fdMd5) w = 2000;
 			trainingSamples.push({ x, y: level, w });
 		} catch (e: any) {
 			if (e?.code === "ENOENT") {
@@ -1168,6 +1222,31 @@ async function main(): Promise<void> {
 				if (e?.code === "ENOENT") return;
 				const msg = e?.message ? String(e.message) : String(e);
 				console.warn(`normal training analyze failed: ${song.path} (${msg})`);
+			}
+		});
+	}
+
+	// Add overjoy table samples (very high difficulty). Prefer overjoy mapping for ★26+; for 21..25 skip if already in insane.
+	if (overjoyMd5ToStar.size > 0 && overjoyWeight > 0) {
+		const overjoySongs: Array<{ song: SongRow; star: number }> = [];
+		for (const [md5, star] of overjoyMd5ToStar) {
+			const s = songsByMd5.get(md5);
+			if (!s) continue;
+			if (star <= 25 && insaneMd5ToLevel.has(md5)) continue;
+			overjoySongs.push({ song: s, star });
+		}
+		console.log(`overjoy charts found in DB: ${overjoySongs.length}`);
+		await mapLimit(overjoySongs, concurrency, async (it) => {
+			try {
+				const r = await analyzeSong(it.song);
+				const x = featureVector(r.features);
+				// Weight: slightly higher, and emphasize the top end where sample scarcity matters.
+				const w = it.star >= 25 ? overjoyWeight * 2.2 : overjoyWeight;
+				trainingSamples.push({ x, y: it.star, w });
+			} catch (e: any) {
+				if (e?.code === "ENOENT") return;
+				const msg = e?.message ? String(e.message) : String(e);
+				console.warn(`overjoy training analyze failed: ${it.song.path} (${msg})`);
 			}
 		});
 	}
@@ -1214,7 +1293,9 @@ async function main(): Promise<void> {
 		try {
 			const r = await analyzeSong(song);
 			if (!passesFilters(song, r)) return;
-			const star = clamp(mapper(r.features), starMin, starMax);
+			// Honor the explicit anchor: ★25 is FREEDOM DiVE [FOUR DIMENSIONS]
+			const rawStar = fdMd5 && song.md5 === fdMd5 ? 25 : mapper(r.features);
+			const star = clamp(rawStar, starMin, starMax);
 			let starRoundedNum = Math.round(star * 2) / 2;
 			if (Object.is(starRoundedNum, -0)) starRoundedNum = 0;
 			const starRounded = starRoundedNum.toFixed(1);
